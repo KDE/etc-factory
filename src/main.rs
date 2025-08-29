@@ -4,7 +4,8 @@
 use clap::Parser;
 use core::panic;
 use libbtrfsutil::{CreateSnapshotOptions, CreateSubvolumeOptions, DeleteSubvolumeOptions};
-use libc::{EINVAL, ENOENT};
+use libc::EINVAL;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
 use std::{
@@ -12,15 +13,14 @@ use std::{
     error::Error,
     fs::{self, File},
     io,
-    path::{self, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
     time::SystemTime,
 };
 use walkdir::{DirEntry, WalkDir};
 
-const HASH_KEY: &str = "trusted.etc.factory.sha256";
-const LINK_KEY: &str = "trusted.etc.factory.symlink-target";
-const LAST_UPDATE_KEY: &str = "trusted.etc.factory.last-update";
+const REAL_ETC: &str = "/etc";
+const CONFIG_FILE: &str = ".etc-factory.json";
 const FACTORY: &str = "/usr/share/factory/etc/"; // Trailing slash is important; we use this as input for strip_prefix
 
 #[derive(Parser)]
@@ -30,6 +30,249 @@ struct Args {
     migrate: bool,
     #[arg(long)]
     replace: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileEntry {
+    hash: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LinkEntry {
+    target: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EtcFactory {
+    #[serde(skip)]
+    path: PathBuf,
+    version: u32,
+    last_update: u64,
+    files: std::collections::HashMap<PathBuf, FileEntry>,
+    links: std::collections::HashMap<PathBuf, LinkEntry>,
+}
+
+impl EtcFactory {
+    fn new(path: PathBuf) -> Result<EtcFactory, Box<dyn std::error::Error>> {
+        let file = File::open(&path);
+        let mut factory = match file {
+            Ok(f) => serde_json::from_reader(f)?,
+            Err(_) => EtcFactory {
+                path: path.clone(),
+                version: 1,
+                last_update: 0,
+                files: std::collections::HashMap::new(),
+                links: std::collections::HashMap::new(),
+            },
+        };
+        factory.path = path;
+        Ok(factory)
+    }
+
+    fn write(&mut self, new_update: u64) -> Result<(), Box<dyn std::error::Error>> {
+        self.last_update = new_update;
+        let file = File::create(&self.path)?;
+        serde_json::to_writer(file, &self)?;
+        Ok(())
+    }
+
+    fn process_symlink(
+        &mut self,
+        relative_path: &Path,
+        path: &Path,
+        etc_path: PathBuf,
+        migrate: &bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let target = fs::read_link(&path).map_err(|e| {
+            eprintln!("Failed to read symlink {}: {}", path.display(), e);
+            Box::new(e) as Box<dyn Error>
+        })?;
+        if target == PathBuf::from("/dev/null") {
+            eprintln!("Skipping /dev/null symlink at {}", path.display());
+            return Ok(());
+        }
+
+        println!("Symlink target: {}", target.display());
+
+        if target == fs::read_link(&etc_path).unwrap_or_default() {
+            println!("Symlink unchanged: {}", etc_path.display());
+            // Link is already correct.
+            if *migrate {
+                // But adopt it in case we are migrating
+                self.links.insert(
+                    relative_path.to_path_buf(),
+                    LinkEntry {
+                        target: target.clone(),
+                    },
+                );
+            }
+            return Ok(());
+        }
+
+        match self.links.get(&relative_path.to_path_buf()) {
+            Some(existing) => {
+                if existing.target == target {
+                    // Link is unchanged.
+                    return Ok(());
+                }
+                fs::remove_file(&etc_path).map_err(|e| {
+                    eprintln!(
+                        "Failed to remove existing file {}: {}",
+                        etc_path.display(),
+                        e
+                    );
+                    Box::new(e) as Box<dyn Error>
+                })?;
+            }
+            None => {
+                if !migrate {
+                    eprintln!(
+                        "File {} exists but has no symlink target!",
+                        etc_path.display()
+                    );
+                    panic!(
+                        "File {} exists but has no symlink target!",
+                        etc_path.display()
+                    );
+                } else if fs::read_link(&etc_path).is_ok() {
+                    // This symlink exists in etc which means it is managed by the user already
+                    // (if it wasn't it would have been removed earlier)
+                    return Ok(());
+                }
+            }
+        }
+
+        match etc_path.parent().map(|p| fs::create_dir_all(p)).transpose() {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    return Ok(());
+                }
+                eprintln!(
+                    "Failed to create parent directories for {}: {}",
+                    etc_path.display(),
+                    e
+                );
+                return Err(Box::new(e) as Box<dyn Error>);
+            }
+        }
+
+        println!("Updating: {}", etc_path.display());
+
+        symlink(&target, &etc_path)
+            .or_else(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| {
+                eprintln!(
+                    "Failed to create symlink {} -> {}: {}",
+                    etc_path.display(),
+                    target.display(),
+                    e
+                );
+                Box::new(e) as Box<dyn Error>
+            })?;
+
+        self.links.insert(
+            relative_path.to_path_buf(),
+            LinkEntry {
+                target: target.clone(),
+            },
+        );
+
+        Ok(())
+    }
+
+    fn process(
+        &mut self,
+        etc: &Path,
+        path: &Path,
+        entry: DirEntry,
+        migrate: &bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let relative_path = path.strip_prefix(FACTORY).map_err(|e| {
+            eprintln!(
+                "Failed to strip prefix {} from {}: {}",
+                FACTORY,
+                path.display(),
+                e
+            );
+            Box::new(e) as Box<dyn Error>
+        })?;
+        let etc_path = etc.join(relative_path);
+
+        if entry.metadata()?.is_symlink() {
+            return self.process_symlink(relative_path, path, etc_path, migrate);
+        }
+
+        let mut file = File::open(path)?;
+        let mut hasher = Sha256::new();
+        let _ = io::copy(&mut file, &mut hasher)?;
+        let hash = hasher.finalize();
+
+        match self.files.get(&etc_path) {
+            Some(existing) => {
+                let mut file = fs::File::open(&path)?;
+                let mut hasher = Sha256::new();
+                let _ = io::copy(&mut file, &mut hasher)?;
+                let hash = hasher.finalize();
+
+                if hash.as_slice() == existing.hash.as_slice() {
+                    // Unchanged
+                    return Ok(());
+                }
+            }
+            None => {
+                if !migrate {
+                    eprintln!("File {} exists but has no hash!", etc_path.display());
+                    panic!("File {} exists but has no hash!", etc_path.display());
+                } else if etc_path.exists() {
+                    eprintln!("Migrating untracked file {}!", etc_path.display());
+                    fs::remove_file(&etc_path).map_err(|e| {
+                        eprintln!(
+                            "Failed to remove existing file {}: {}",
+                            etc_path.display(),
+                            e
+                        );
+                        Box::new(e) as Box<dyn Error>
+                    })?;
+                }
+            }
+        }
+
+        println!("Updating: {}", etc_path.display());
+
+        match etc_path.parent().map(|p| fs::create_dir_all(p)).transpose() {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    return Ok(());
+                }
+
+                eprintln!(
+                    "Failed to create parent directories for {}: {}",
+                    etc_path.display(),
+                    e
+                );
+                return Err(Box::new(e) as Box<dyn Error>);
+            }
+        }
+
+        fs::copy(&path, &etc_path)?;
+
+        self.files.insert(
+            relative_path.to_path_buf(),
+            FileEntry {
+                hash: hash.to_vec(),
+            },
+        );
+
+        Ok(())
+    }
 }
 
 fn seed_subvolume(etc: &str) -> Result<(), Box<dyn Error>> {
@@ -42,7 +285,7 @@ fn seed_subvolume(etc: &str) -> Result<(), Box<dyn Error>> {
         .arg("--archive")
         .arg("--recursive")
         .arg("--verbose")
-        .arg("/etc/.")
+        .arg(REAL_ETC.to_owned() + "/.")
         .arg(etc)
         .status()
         .map_err(|e| {
@@ -89,7 +332,7 @@ fn create_subvolume(etc: &str, migrate: &bool) -> Result<(), Box<dyn Error>> {
     CreateSnapshotOptions::new()
         .readonly(false)
         .recursive(true)
-        .create("/etc", etc)
+        .create(REAL_ETC, etc)
         .or_else(|e| {
             if e.errno() == EINVAL {
                 if !migrate {
@@ -106,218 +349,15 @@ fn create_subvolume(etc: &str, migrate: &bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn process_symlink(path: &Path, etc_path: PathBuf, migrate: &bool) -> Result<(), Box<dyn Error>> {
-    let target = fs::read_link(&path).map_err(|e| {
-        eprintln!("Failed to read symlink {}: {}", path.display(), e);
-        Box::new(e) as Box<dyn Error>
-    })?;
-    if target == PathBuf::from("/dev/null") {
-        eprintln!("Skipping /dev/null symlink at {}", path.display());
-        return Ok(());
-    }
-
-    println!("Symlink target: {}", target.display());
-
-    if target == fs::read_link(&etc_path).unwrap_or_default() {
-        println!("Symlink unchanged: {}", etc_path.display());
-        // Link is already correct.
-        if *migrate {
-            // But adopt it in case we are migrating
-            xattr::set(
-                etc_path,
-                LINK_KEY,
-                target.to_str().unwrap_or_default().as_bytes(),
-            )?;
-        }
-        return Ok(());
-    }
-
-    match xattr::get(&etc_path, LINK_KEY) {
-        Ok(Some(existing)) => {
-            let existing_target = std::str::from_utf8(existing.as_slice())?;
-            if existing_target == target.to_string_lossy() {
-                // Link is unchanged.
-                return Ok(());
-            }
-            fs::remove_file(&etc_path).map_err(|e| {
-                eprintln!(
-                    "Failed to remove existing file {}: {}",
-                    etc_path.display(),
-                    e
-                );
-                Box::new(e) as Box<dyn Error>
-            })?;
-        }
-        Ok(None) => {
-            if !migrate {
-                eprintln!(
-                    "File {} exists but has no symlink target!",
-                    etc_path.display()
-                );
-                panic!(
-                    "File {} exists but has no symlink target!",
-                    etc_path.display()
-                );
-            } else {
-                eprintln!("Migrating untracked symlink {}!", etc_path.display());
-
-                if etc_path.exists() {
-                    // Must be a user entity. Leave it untouched.
-                    return Ok(());
-                }
-            }
-        }
-        Err(e) => {
-            if e.raw_os_error() == Some(ENOENT) {
-                // File doesn't exist, that's fine we'll create it.
-            } else {
-                eprintln!("Failed to get xattr for {}: {}", etc_path.display(), e);
-                return Ok(()); // Whatever this path is, it's not for us!
-            }
-        }
-    }
-
-    etc_path
-        .parent()
-        .map(|p| fs::create_dir_all(p))
-        .transpose()
-        .map_err(|e| {
-            eprintln!(
-                "Failed to create parent directories for {}: {}",
-                etc_path.display(),
-                e
-            );
-            Box::new(e) as Box<dyn Error>
-        })?;
-
-    println!("Updating: {}", etc_path.display());
-
-    symlink(&target, &etc_path)
-        .or_else(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })
-        .map_err(|e| {
-            eprintln!(
-                "Failed to create symlink {} -> {}: {}",
-                etc_path.display(),
-                target.display(),
-                e
-            );
-            Box::new(e) as Box<dyn Error>
-        })?;
-
-    xattr::set(
-        etc_path,
-        LINK_KEY,
-        target.to_str().unwrap_or_default().as_bytes(),
-    )?;
-
-    Ok(())
-}
-
-fn process(etc: &str, path: &Path, entry: DirEntry, migrate: &bool) -> Result<(), Box<dyn Error>> {
-    let relative_path = path.strip_prefix(FACTORY).map_err(|e| {
-        eprintln!(
-            "Failed to strip prefix {} from {}: {}",
-            FACTORY,
-            path.display(),
-            e
-        );
-        Box::new(e) as Box<dyn Error>
-    })?;
-    let etc_path = path::Path::new(etc).join(relative_path);
-
-    if entry.metadata()?.is_symlink() {
-        return process_symlink(path, etc_path, migrate);
-    }
-
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let _ = io::copy(&mut file, &mut hasher)?;
-    let hash = hasher.finalize();
-
-    match xattr::get(&etc_path, HASH_KEY) {
-        Ok(Some(existing)) => {
-            let mut file = fs::File::open(&path)?;
-            let mut hasher = Sha256::new();
-            let _ = io::copy(&mut file, &mut hasher)?;
-            let hash = hasher.finalize();
-
-            if hash.as_slice() == existing {
-                // Unchanged
-                return Ok(());
-            }
-        }
-        Ok(None) => {
-            if !migrate {
-                eprintln!("File {} exists but has no hash!", etc_path.display());
-                panic!("File {} exists but has no hash!", etc_path.display());
-            } else {
-                eprintln!("Migrating untracked file {}!", etc_path.display());
-                fs::remove_file(&etc_path).map_err(|e| {
-                    eprintln!(
-                        "Failed to remove existing file {}: {}",
-                        etc_path.display(),
-                        e
-                    );
-                    Box::new(e) as Box<dyn Error>
-                })?;
-            }
-        }
-        Err(e) => {
-            if e.raw_os_error() == Some(ENOENT) {
-                // File doesn't exist, that's fine we'll create it.
-            } else {
-                eprintln!("Failed to get xattr for {}: {}", etc_path.display(), e);
-                return Ok(()); // Whatever this path is, it's not for us!
-            }
-        }
-    }
-
-    println!("Updating: {}", etc_path.display());
-
-    etc_path
-        .parent()
-        .map(|p| fs::create_dir_all(p))
-        .transpose()
-        .map_err(|e| {
-            eprintln!(
-                "Failed to create parent directories for {}: {}",
-                etc_path.display(),
-                e
-            );
-            Box::new(e) as Box<dyn Error>
-        })?;
-
-    fs::copy(&path, &etc_path)?;
-
-    xattr::set(etc_path, HASH_KEY, &hash)?;
-
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let migrate = &args.migrate;
 
-    let etc = "/.etc.new/";
-    create_subvolume(etc, migrate)?;
+    let etc_str = "/.etc.new/";
+    let etc = Path::new(etc_str);
+    create_subvolume(&etc_str, migrate)?;
 
-    let last_update = match xattr::get(etc, LAST_UPDATE_KEY) {
-        Ok(Some(stamp)) => std::str::from_utf8(stamp.as_slice())?.parse::<u64>()?,
-        Ok(None) => 0,
-        Err(e) => {
-            if e.raw_os_error() == Some(ENOENT) {
-                0
-            } else {
-                return Err(Box::new(e));
-            }
-        }
-    };
+    let mut factory = EtcFactory::new(etc.join(CONFIG_FILE))?;
 
     let mut new_update: u64 = 0;
     for entry in WalkDir::new(FACTORY)
@@ -327,45 +367,60 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         let path = entry.path();
 
-        if [".pwd.lock", "passwd", "shadow", "group", "localtime", "machine-id"].iter().any(|s| {
-            path.file_name()
-                .map(|f| f == *s)
-                .unwrap_or(false)
-        }) {
+        if [
+            ".pwd.lock",
+            "passwd",
+            "shadow",
+            "group",
+            "localtime",
+            "machine-id",
+        ]
+        .iter()
+        .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))
+        {
             // Never ever ever ever touch these files!
             // It's a bit silly to have them in the factory dir but whatever.
             println!("Skipping sensitive file: {}", path.display());
             continue;
         }
 
-        let update = entry.metadata()?.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-        if last_update >= update {
+        let update = entry
+            .metadata()?
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs();
+        if factory.last_update >= update {
             // File hasn't changed since last update, skip.
             continue;
         }
         new_update = max(new_update, update);
 
-        process(etc, path, entry.clone(), migrate)?;
+        factory.process(etc, path, entry.clone(), migrate)?;
     }
 
     println!(
         "Last update was at {}, new update is at {}",
-        last_update, new_update
+        factory.last_update, new_update
     );
 
-    if new_update == 0 || new_update == last_update {
+    if new_update == 0 || new_update == factory.last_update {
         // Nothing was updated, nothing to do.
         return Ok(());
     }
 
-    if args.replace {
-        std::fs::rename("/etc", format!("/.etc.{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs()))?;
-        std::fs::rename(etc, "/etc")?;
+    let _ = factory.write(new_update);
 
-        xattr::set("/etc", LAST_UPDATE_KEY, &new_update.to_string().as_bytes()).map_err(|e| {
-            eprintln!("Failed to set last update xattr: {}", e);
-            Box::new(e) as Box<dyn Error>
-        })?;
+    if args.replace {
+        std::fs::rename(
+            REAL_ETC,
+            format!(
+                "/.etc.{}",
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs()
+            ),
+        )?;
+        std::fs::rename(etc, REAL_ETC)?;
     }
 
     Ok(())

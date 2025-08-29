@@ -14,4 +14,5 @@ libbtrfsutil = "0.7.1"
 libc = "0.2.175"
 sha2 = "0.10.9"
 walkdir = "2.5.0"
-xattr = "1.5.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

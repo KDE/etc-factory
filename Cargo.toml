@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: None
+
+[package]
+name = "etc-factory"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+base16ct = { version = "0.3.0", features = ["alloc"] }
+clap = { version = "4", features = ["derive"] }
+hex-literal = "1.0.0"
+libbtrfsutil = "0.7.1"
+libc = "0.2.175"
+sha2 = "0.10.9"
+walkdir = "2.5.0"
+xattr = "1.5.1"

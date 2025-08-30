@@ -6,7 +6,22 @@ all: etc-factory
 clean:
 	rm -rf target
 
+test_prepare:
+	[ -d mnt ] || mkdir mnt
+	[ -f test.img ] || fallocate -l 260M test.img
+	umount test.img || true
+	mkfs.btrfs -f test.img
+	mount test.img mnt
+	chown ${CHOWN_ID}:${CHOWN_ID} mnt
+	cp -rv fixture/. mnt/
+	chown -R ${CHOWN_ID}:${CHOWN_ID} mnt
+
 test:
+ifneq ($(shell id -u), 0)
+	sudo CHOWN_ID=${USER} make test_prepare
+else
+	make test_prepare
+endif
 	cargo test
 
 etc-factory:

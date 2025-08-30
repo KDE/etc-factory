@@ -5,6 +5,7 @@ include:
   - project: sysadmin/ci-utilities
     file:
       - /gitlab-templates/reuse-lint.yml
+      - /gitlab-templates/blocks/workflow.yml
 
 stages:
   - validate
@@ -12,10 +13,13 @@ stages:
 
 rust-latest:
   stage: build
-  image: rust:latest
-  before_script:
-    - apt-get update
-    - apt-get install -y clang llvm-dev libclang-dev pkg-config libbtrfsutil-dev
+  tags:
+    - VM
+    - amd64
+  image: storage.kde.org/vm-images/kde-linux-builder
+  # before_script:
+  #   - apt-get update
+  #   - apt-get install -y clang llvm-dev libclang-dev pkg-config libbtrfsutil-dev btrfs-progs
   script:
     - cargo build
-    - cargo test --verbose
+    - make test

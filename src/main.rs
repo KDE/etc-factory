@@ -8,6 +8,7 @@ use libc::EINVAL;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
+use std::sync::{LazyLock, Mutex};
 use std::{
     cmp::max,
     error::Error,
@@ -19,9 +20,36 @@ use std::{
 };
 use walkdir::{DirEntry, WalkDir};
 
-const REAL_ETC: &str = "/etc";
 const CONFIG_FILE: &str = ".etc-factory.json";
-const FACTORY: &str = "/usr/share/factory/etc/"; // Trailing slash is important; we use this as input for strip_prefix
+const FACTORY_SYMLINK_COMPONENT: &str = "usr/share/factory/etc/"; // Trailing slash is important; we use this as input for strip_prefix
+
+static SYSROOT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(Args::parse().sysroot));
+
+struct Paths {}
+
+impl Paths {
+    fn etc() -> String {
+        SYSROOT.lock().expect("Failed to lock sysroot").to_owned() + ".etc.new/"
+    }
+
+    fn real_etc() -> String {
+        SYSROOT.lock().expect("Failed to lock sysroot").to_owned() + "etc/"
+    }
+
+    fn factory() -> String {
+        SYSROOT.lock().expect("Failed to lock sysroot").to_owned() + "usr/share/factory/etc/"
+    }
+
+    fn backup_etc() -> Result<String, Box<dyn Error>> {
+        let time = format!(
+            "/.etc.{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs()
+        );
+        Ok(SYSROOT.lock().expect("Failed to lock sysroot").to_owned() + time.as_str())
+    }
+}
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -30,6 +58,8 @@ struct Args {
     migrate: bool,
     #[arg(long)]
     replace: bool,
+    #[arg(long, default_value = "/")]
+    sysroot: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,10 +224,10 @@ impl EtcFactory {
         entry: DirEntry,
         migrate: &bool,
     ) -> Result<(), Box<dyn Error>> {
-        let relative_path = path.strip_prefix(FACTORY).map_err(|e| {
+        let relative_path = path.strip_prefix(Paths::factory()).map_err(|e| {
             eprintln!(
                 "Failed to strip prefix {} from {}: {}",
-                FACTORY,
+                Paths::factory(),
                 path.display(),
                 e
             );
@@ -273,6 +303,48 @@ impl EtcFactory {
 
         Ok(())
     }
+
+    fn process_all(&mut self, etc: &Path, migrate: &bool) -> Result<u64, Box<dyn Error>> {
+        let mut new_update: u64 = 0;
+        for entry in WalkDir::new(Paths::factory())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.metadata().unwrap().is_file() || e.metadata().unwrap().is_symlink())
+        {
+            let path = entry.path();
+
+            if [
+                ".pwd.lock",
+                "passwd",
+                "shadow",
+                "group",
+                "localtime",
+                "machine-id",
+            ]
+            .iter()
+            .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))
+            {
+                // Never ever ever ever touch these files!
+                // It's a bit silly to have them in the factory dir but whatever.
+                println!("Skipping sensitive file: {}", path.display());
+                continue;
+            }
+
+            let update = entry
+                .metadata()?
+                .modified()?
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
+            if self.last_update >= update {
+                // File hasn't changed since last update, skip.
+                continue;
+            }
+            new_update = max(new_update, update);
+
+            self.process(etc, path, entry.clone(), migrate)?;
+        }
+        Ok(new_update)
+    }
 }
 
 fn seed_subvolume(etc: &str) -> Result<(), Box<dyn Error>> {
@@ -284,8 +356,7 @@ fn seed_subvolume(etc: &str) -> Result<(), Box<dyn Error>> {
     Command::new("cp")
         .arg("--archive")
         .arg("--recursive")
-        .arg("--verbose")
-        .arg(REAL_ETC.to_owned() + "/.")
+        .arg(Paths::real_etc().to_owned() + "/.")
         .arg(etc)
         .status()
         .map_err(|e| {
@@ -306,7 +377,8 @@ fn seed_subvolume(etc: &str) -> Result<(), Box<dyn Error>> {
         .filter(|e| e.metadata().unwrap().is_symlink())
     {
         let target = fs::read_link(entry.path())?;
-        if target.to_string_lossy().contains(FACTORY) {
+        println!("Symlink target: {}", target.display());
+        if target.to_string_lossy().contains(FACTORY_SYMLINK_COMPONENT) {
             eprintln!(
                 "Removing symlink to factory: {} -> {}",
                 entry.path().display(),
@@ -329,10 +401,11 @@ fn create_subvolume(etc: &str, migrate: &bool) -> Result<(), Box<dyn Error>> {
             fs::remove_dir_all(etc).ok();
             Ok::<(), Box<dyn Error>>(())
         })?;
+    println!("Creating snapshot of {} at {}", Paths::real_etc(), etc);
     CreateSnapshotOptions::new()
         .readonly(false)
         .recursive(true)
-        .create(REAL_ETC, etc)
+        .create(Paths::real_etc(), etc)
         .or_else(|e| {
             if e.errno() == EINVAL {
                 if !migrate {
@@ -353,50 +426,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let migrate = &args.migrate;
 
-    let etc_str = "/.etc.new/";
+    let etc_str = &Paths::etc();
     let etc = Path::new(etc_str);
     create_subvolume(&etc_str, migrate)?;
 
     let mut factory = EtcFactory::new(etc.join(CONFIG_FILE))?;
-
-    let mut new_update: u64 = 0;
-    for entry in WalkDir::new(FACTORY)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.metadata().unwrap().is_file() || e.metadata().unwrap().is_symlink())
-    {
-        let path = entry.path();
-
-        if [
-            ".pwd.lock",
-            "passwd",
-            "shadow",
-            "group",
-            "localtime",
-            "machine-id",
-        ]
-        .iter()
-        .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))
-        {
-            // Never ever ever ever touch these files!
-            // It's a bit silly to have them in the factory dir but whatever.
-            println!("Skipping sensitive file: {}", path.display());
-            continue;
-        }
-
-        let update = entry
-            .metadata()?
-            .modified()?
-            .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_secs();
-        if factory.last_update >= update {
-            // File hasn't changed since last update, skip.
-            continue;
-        }
-        new_update = max(new_update, update);
-
-        factory.process(etc, path, entry.clone(), migrate)?;
-    }
+    let new_update = factory.process_all(etc, migrate)?;
 
     println!(
         "Last update was at {}, new update is at {}",
@@ -411,17 +446,63 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _ = factory.write(new_update);
 
     if args.replace {
-        std::fs::rename(
-            REAL_ETC,
-            format!(
-                "/.etc.{}",
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs()
-            ),
-        )?;
-        std::fs::rename(etc, REAL_ETC)?;
+        std::fs::rename(Paths::real_etc(), Paths::backup_etc()?)?;
+        std::fs::rename(etc, Paths::real_etc())?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::{env, error::Error, fs::File};
+
+    #[test]
+    fn test_0_processor() -> Result<(), Box<dyn Error>> {
+        *SYSROOT.lock()? = env::current_dir()?.to_string_lossy().to_string() + "/mnt/";
+
+        create_subvolume(&Paths::etc(), &true)?;
+
+        assert!(Path::new(&Paths::etc()).exists());
+        assert!(Path::new(&Paths::real_etc()).exists());
+        assert!(!Path::new(&Paths::etc()).join("asymlinktofactory").exists());
+
+        let etc_str = &Paths::etc();
+        let etc = Path::new(etc_str);
+        let migrate = &true;
+
+        let mut factory = EtcFactory::new(etc.join(CONFIG_FILE))?;
+        let new_update = factory.process_all(etc, migrate)?;
+        factory.write(new_update)?;
+
+        assert!(Path::new(&Paths::etc()).exists());
+        assert!(Path::new(&Paths::real_etc()).exists());
+        // Should get cleaned up
+        assert!(!Path::new(&Paths::etc()).join("asymlinktofactory").exists());
+
+        assert!(new_update > 0);
+
+        let file = File::open(Path::new(&Paths::etc()).join(CONFIG_FILE))?;
+        let factory: EtcFactory = serde_json::from_reader(file)?;
+        assert_eq!(factory.last_update, new_update);
+
+        factory.files.iter().for_each(|(k, v)| {
+            println!("File: {} Hash: {:x?}", k.display(), v.hash);
+        });
+
+        factory.links.iter().for_each(|(k, v)| {
+            println!("Link: {} Target: {}", k.display(), v.target.display());
+        });
+
+        // adir/morefile1 (was already there)
+        // adir/morefile2 (was already there)
+        // afile (was already there)
+        // anotherfile (new from factory)
+        assert_eq!(factory.files.keys().len(), 4);
+        // arelativelink (was already there)
+        assert_eq!(factory.links.keys().len(), 1);
+
+        Ok(())
+    }
 }

@@ -2,3 +2,5 @@
 # SPDX-FileCopyrightText: none
 
 /target/
+/mnt/
+/test.img

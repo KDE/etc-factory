@@ -3,6 +3,8 @@
 
 [Unit]
 Description=Updating /etc from factory
+# When the system is volatile we don't really need to run, also chances are /etc is overlay'd breaking btrfs assumptions
+ConditionKernelCommandLine=!systemd.volatile
 ConditionNeedsUpdate=|/etc
 DefaultDependencies=no
 Conflicts=reboot.target kexec.target poweroff.target halt.target

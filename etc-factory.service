@@ -3,6 +3,7 @@
 
 [Unit]
 Description=Updating /etc from factory
+ConditionNeedsUpdate=|/etc
 DefaultDependencies=no
 Conflicts=reboot.target kexec.target poweroff.target halt.target
 After=systemd-fsck-root.service etc.mount

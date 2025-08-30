@@ -11,7 +11,7 @@ Before=local-fs.target shutdown.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/me/etc-factory --migrate --replace
+ExecStart=/usr/lib/etc-factory --migrate --replace
 
 [Install]
 WantedBy=local-fs-pre.target

@@ -76,6 +76,9 @@ struct LinkEntry {
 struct EtcFactory {
     #[serde(skip)]
     path: PathBuf,
+    #[serde(skip)]
+    seen: Vec<PathBuf>,
+
     version: u32,
     last_update: u64,
     files: std::collections::HashMap<PathBuf, FileEntry>,
@@ -89,6 +92,7 @@ impl EtcFactory {
             Ok(f) => serde_json::from_reader(f)?,
             Err(_) => EtcFactory {
                 path: path.clone(),
+                seen: Vec::new(),
                 version: 1,
                 last_update: 0,
                 files: std::collections::HashMap::new(),
@@ -219,20 +223,12 @@ impl EtcFactory {
 
     fn process(
         &mut self,
+        relative_path: &Path,
         etc: &Path,
         path: &Path,
         entry: DirEntry,
         migrate: &bool,
     ) -> Result<(), Box<dyn Error>> {
-        let relative_path = path.strip_prefix(Paths::factory()).map_err(|e| {
-            eprintln!(
-                "Failed to strip prefix {} from {}: {}",
-                Paths::factory(),
-                path.display(),
-                e
-            );
-            Box::new(e) as Box<dyn Error>
-        })?;
         let etc_path = etc.join(relative_path);
 
         if entry.metadata()?.is_symlink() {
@@ -304,6 +300,74 @@ impl EtcFactory {
         Ok(())
     }
 
+    fn force_update(&mut self, new_update: u64)-> Result<u64, Box<dyn Error>> {
+        let update = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
+        return Ok(max(new_update, update));
+    }
+
+    fn process_deleted_files(&mut self, etc: &Path, new_update: u64) -> Result<u64, Box<dyn Error>>{
+        let mut to_drop = Vec::new();
+        for (relative_path, info) in &self.files {
+            if self.seen.contains(relative_path) { // still around
+                continue;
+            }
+            to_drop.push(relative_path.clone());
+
+            let path = etc.join(relative_path);
+
+            let mut file = File::open(&path)?;
+            let mut hasher = Sha256::new();
+            let _ = io::copy(&mut file, &mut hasher)?;
+            let hash = hasher.finalize();
+
+            if hash.as_slice() != info.hash.as_slice() {
+                // File was changed by user. Don't remove it.
+                continue;
+            }
+
+            println!("Removing dangling file: {}", path.display());
+            fs::remove_file(path)?;
+        }
+
+        // Mind that dropping means this file is no longer present in factory.
+        // Whether or not it was removed from etc is a different question.
+        for path in &to_drop {
+            self.files.remove(path);
+        }
+
+        Ok(to_drop.is_empty().then(|| new_update).unwrap_or(self.force_update(new_update)?))
+    }
+
+    fn process_deleted_symlinks(&mut self, etc: &Path, new_update: u64)-> Result<u64, Box<dyn Error>> {
+        let mut to_drop = Vec::new();
+        for (relative_path, info) in &self.links {
+            if self.seen.contains(relative_path) { // still around
+                continue;
+            }
+            to_drop.push(relative_path.clone());
+
+            let path = etc.join(relative_path);
+
+            if fs::read_link(&path).unwrap_or_default() != info.target {
+                // Link was changed by user. Don't remove it.
+                continue;
+            }
+
+            println!("Removing dangling link: {}", path.display());
+            fs::remove_file(path)?;
+        }
+
+        // Mind that dropping means this file is no longer present in factory.
+        // Whether or not it was removed from etc is a different question.
+        for path in &to_drop {
+            self.links.remove(path);
+        }
+
+        Ok(to_drop.is_empty().then(|| new_update).unwrap_or(self.force_update(new_update)?))
+    }
+
     fn process_all(&mut self, etc: &Path, migrate: &bool) -> Result<u64, Box<dyn Error>> {
         let mut new_update: u64 = 0;
         for entry in WalkDir::new(Paths::factory())
@@ -312,6 +376,17 @@ impl EtcFactory {
             .filter(|e| e.metadata().unwrap().is_file() || e.metadata().unwrap().is_symlink())
         {
             let path = entry.path();
+            // TODO pass into process function
+            let relative_path = path.strip_prefix(Paths::factory()).map_err(|e| {
+                eprintln!(
+                    "Failed to strip prefix {} from {}: {}",
+                    Paths::factory(),
+                    path.display(),
+                    e
+                );
+                Box::new(e) as Box<dyn Error>
+            })?;
+            self.seen.push(relative_path.to_path_buf());
 
             if [
                 ".pwd.lock",
@@ -342,8 +417,12 @@ impl EtcFactory {
             }
             new_update = max(new_update, update);
 
-            self.process(etc, path, entry.clone(), migrate)?;
+            self.process(relative_path, etc, path, entry.clone(), migrate)?;
         }
+
+        new_update = max(new_update, self.process_deleted_files(etc, new_update)?);
+        new_update = max(new_update, self.process_deleted_symlinks(etc, new_update)?);
+
         Ok(new_update)
     }
 }
@@ -457,7 +536,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::{env, error::Error, fs::File};
+    use std::{env, error::Error, fs::File, thread::sleep};
 
     #[test]
     fn test_0_processor() -> Result<(), Box<dyn Error>> {
@@ -503,6 +582,19 @@ mod test {
         assert_eq!(factory.files.keys().len(), 4);
         // arelativelink (was already there)
         assert_eq!(factory.links.keys().len(), 1);
+
+        // Remove dangling file ------------------------------------------------
+
+        fs::remove_file(Path::new(&Paths::factory()).join("arelativelink")).ok();
+
+        sleep(std::time::Duration::from_secs(1)); // Ensure time changes
+        let mut factory = EtcFactory::new(etc.join(CONFIG_FILE))?;
+        let new_new_update = factory.process_all(etc, migrate)?;
+
+        assert_ne!(new_update, new_new_update);
+        assert_eq!(factory.files.keys().len(), 4);
+        // Link has been removed as dangling
+        assert_eq!(factory.links.keys().len(), 0);
 
         Ok(())
     }

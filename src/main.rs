@@ -320,6 +320,7 @@ impl EtcFactory {
                 "group",
                 "localtime",
                 "machine-id",
+                "fstab",
             ]
             .iter()
             .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))

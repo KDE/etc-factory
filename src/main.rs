@@ -391,11 +391,24 @@ impl EtcFactory {
             if [
                 ".pwd.lock",
                 "passwd",
+                "passwd-",
                 "shadow",
+                "shadow-",
+                "gshadow",
+                "gshadow-",
                 "group",
+                "group-",
                 "localtime",
                 "machine-id",
                 "fstab",
+                "subuid",
+                "subgid-",
+                "subgid",
+                "subgid-",
+                "crypttab",
+                "vconsole.conf",
+                "hostname",
+                "hosts",
             ]
             .iter()
             .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))

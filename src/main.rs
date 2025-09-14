@@ -300,17 +300,22 @@ impl EtcFactory {
         Ok(())
     }
 
-    fn force_update(&mut self, new_update: u64)-> Result<u64, Box<dyn Error>> {
+    fn force_update(&mut self, new_update: u64) -> Result<u64, Box<dyn Error>> {
         let update = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs();
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs();
         return Ok(max(new_update, update));
     }
 
-    fn process_deleted_files(&mut self, etc: &Path, new_update: u64) -> Result<u64, Box<dyn Error>>{
+    fn process_deleted_files(
+        &mut self,
+        etc: &Path,
+        new_update: u64,
+    ) -> Result<u64, Box<dyn Error>> {
         let mut to_drop = Vec::new();
         for (relative_path, info) in &self.files {
-            if self.seen.contains(relative_path) { // still around
+            if self.seen.contains(relative_path) {
+                // still around
                 continue;
             }
             to_drop.push(relative_path.clone());
@@ -337,13 +342,21 @@ impl EtcFactory {
             self.files.remove(path);
         }
 
-        Ok(to_drop.is_empty().then(|| new_update).unwrap_or(self.force_update(new_update)?))
+        Ok(to_drop
+            .is_empty()
+            .then(|| new_update)
+            .unwrap_or(self.force_update(new_update)?))
     }
 
-    fn process_deleted_symlinks(&mut self, etc: &Path, new_update: u64)-> Result<u64, Box<dyn Error>> {
+    fn process_deleted_symlinks(
+        &mut self,
+        etc: &Path,
+        new_update: u64,
+    ) -> Result<u64, Box<dyn Error>> {
         let mut to_drop = Vec::new();
         for (relative_path, info) in &self.links {
-            if self.seen.contains(relative_path) { // still around
+            if self.seen.contains(relative_path) {
+                // still around
                 continue;
             }
             to_drop.push(relative_path.clone());
@@ -365,7 +378,10 @@ impl EtcFactory {
             self.links.remove(path);
         }
 
-        Ok(to_drop.is_empty().then(|| new_update).unwrap_or(self.force_update(new_update)?))
+        Ok(to_drop
+            .is_empty()
+            .then(|| new_update)
+            .unwrap_or(self.force_update(new_update)?))
     }
 
     fn process_all(&mut self, etc: &Path, migrate: &bool) -> Result<u64, Box<dyn Error>> {

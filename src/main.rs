@@ -425,6 +425,8 @@ impl EtcFactory {
                 "vconsole.conf",
                 "hostname",
                 "hosts",
+                "locale.conf",
+                "locale.gen",
             ]
             .iter()
             .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))

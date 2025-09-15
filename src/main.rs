@@ -23,7 +23,13 @@ use walkdir::{DirEntry, WalkDir};
 const CONFIG_FILE: &str = ".etc-factory.json";
 const FACTORY_SYMLINK_COMPONENT: &str = "usr/share/factory/etc/"; // Trailing slash is important; we use this as input for strip_prefix
 
-static SYSROOT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(Args::parse().sysroot));
+static SYSROOT: LazyLock<Mutex<String>> = LazyLock::new(|| {
+    let mut sysroot = Args::parse().sysroot;
+    if !sysroot.ends_with('/') {
+        sysroot = sysroot + "/";
+    }
+    Mutex::new(sysroot)
+});
 
 struct Paths {}
 

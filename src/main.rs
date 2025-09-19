@@ -23,6 +23,33 @@ use walkdir::{DirEntry, WalkDir};
 const CONFIG_FILE: &str = ".etc-factory.json";
 const FACTORY_SYMLINK_COMPONENT: &str = "usr/share/factory/etc/"; // Trailing slash is important; we use this as input for strip_prefix
 
+const COPY_FILES_NEVER: &[&str] = &[
+    ".pwd.lock",
+    "passwd",
+    "passwd-",
+    "shadow",
+    "shadow-",
+    "gshadow",
+    "gshadow-",
+    "group",
+    "group-",
+    "localtime",
+    "machine-id",
+    "fstab",
+    "crypttab",
+    "vconsole.conf",
+    "hostname",
+    "hosts",
+    "locale.conf",
+    "locale.gen",
+];
+
+const COPY_FILES_ONCE: &[&str] = &[
+    // These must be originally copied into place so they actually get managed by useradd.
+    // Otherwise podman won't work.
+    "subuid", "subgid-", "subgid", "subgid-",
+];
+
 static SYSROOT: LazyLock<Mutex<String>> = LazyLock::new(|| {
     let mut sysroot = Args::parse().sysroot;
     if !sysroot.ends_with('/') {
@@ -390,6 +417,18 @@ impl EtcFactory {
             .unwrap_or(self.force_update(new_update)?))
     }
 
+    fn copy_once(&self, relative_path:&Path, etc: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
+        let etc_path = etc.join(relative_path);
+        if etc_path.exists() {
+            // Already exists, nothing to do.
+            return Ok(());
+        }
+
+        println!("Copying once: {}", etc_path.display());
+        fs::copy(&path, &etc_path)?;
+        Ok(())
+    }
+
     fn process_all(&mut self, etc: &Path, migrate: &bool) -> Result<u64, Box<dyn Error>> {
         let mut new_update: u64 = 0;
         for entry in WalkDir::new(Paths::factory())
@@ -398,7 +437,6 @@ impl EtcFactory {
             .filter(|e| e.metadata().unwrap().is_file() || e.metadata().unwrap().is_symlink())
         {
             let path = entry.path();
-            // TODO pass into process function
             let relative_path = path.strip_prefix(Paths::factory()).map_err(|e| {
                 eprintln!(
                     "Failed to strip prefix {} from {}: {}",
@@ -410,32 +448,19 @@ impl EtcFactory {
             })?;
             self.seen.push(relative_path.to_path_buf());
 
-            if [
-                ".pwd.lock",
-                "passwd",
-                "passwd-",
-                "shadow",
-                "shadow-",
-                "gshadow",
-                "gshadow-",
-                "group",
-                "group-",
-                "localtime",
-                "machine-id",
-                "fstab",
-                "subuid",
-                "subgid-",
-                "subgid",
-                "subgid-",
-                "crypttab",
-                "vconsole.conf",
-                "hostname",
-                "hosts",
-                "locale.conf",
-                "locale.gen",
-            ]
-            .iter()
-            .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))
+            if COPY_FILES_ONCE
+                .iter()
+                .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))
+            {
+                // Only ever touch these files if they don't already exist.
+                // We also don't track them in the json.
+                self.copy_once(relative_path, etc, path)?;
+                continue;
+            }
+
+            if COPY_FILES_NEVER
+                .iter()
+                .any(|s| path.file_name().map(|f| f == *s).unwrap_or(false))
             {
                 // Never ever ever ever touch these files!
                 // It's a bit silly to have them in the factory dir but whatever.

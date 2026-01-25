@@ -3,17 +3,18 @@
 
 [Unit]
 Description=Updating /etc from factory
+# Only run in initrd
+ConditionPathExists=/etc/initrd-release
 # When the system is volatile we don't really need to run, also chances are /etc is overlay'd breaking btrfs assumptions
 ConditionKernelCommandLine=!systemd.volatile
-ConditionNeedsUpdate=|/etc
 DefaultDependencies=no
 Conflicts=reboot.target kexec.target poweroff.target halt.target
-After=systemd-fsck-root.service etc.mount
-Before=local-fs.target shutdown.target
+After=sysroot.mount sysroot-usr.mount initrd-usr-fs.target
+Before=shutdown.target initrd.target initrd-parse-etc.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/lib/etc-factory --migrate --replace
+ExecStart=/usr/lib/etc-factory --migrate --replace --sysroot /sysroot
 
 [Install]
-WantedBy=local-fs-pre.target
+WantedBy=initrd.target

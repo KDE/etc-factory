@@ -431,6 +431,7 @@ impl EtcFactory {
 
     fn process_all(&mut self, etc: &Path, migrate: &bool) -> Result<u64, Box<dyn Error>> {
         let mut new_update: u64 = 0;
+        assert!(Path::new(&Paths::factory()).exists());
         for entry in WalkDir::new(Paths::factory())
             .into_iter()
             .filter_map(|e| e.ok())

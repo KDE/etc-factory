@@ -5,11 +5,15 @@
 Description=Updating /etc from factory
 # Only run in initrd
 ConditionPathExists=/etc/initrd-release
+# Only run if factory's etc exists (i.e. /usr is mounted)
+ConditionPathExists=/sysroot/usr/share/factory/etc/
 # When the system is volatile we don't really need to run, also chances are /etc is overlay'd breaking btrfs assumptions
 ConditionKernelCommandLine=!systemd.volatile
 DefaultDependencies=no
 Conflicts=reboot.target kexec.target poweroff.target halt.target
 After=sysroot.mount sysroot-usr.mount initrd-usr-fs.target
+# We must only run if the mount units actually succeeded
+Requires=sysroot.mount sysroot-usr.mount initrd-usr-fs.target
 Before=shutdown.target initrd.target initrd-parse-etc.service
 
 [Service]

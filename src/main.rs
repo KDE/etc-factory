@@ -268,20 +268,23 @@ impl EtcFactory {
             return self.process_symlink(relative_path, path, etc_path, migrate);
         }
 
-        let mut file = File::open(path)?;
-        let mut hasher = Sha256::new();
-        let _ = io::copy(&mut file, &mut hasher)?;
-        let hash = hasher.finalize();
+        let factory_hash = file_hasher(path)?.finalize();
 
-        match self.files.get(&etc_path) {
+        match self.files.get(&relative_path.to_path_buf()) {
             Some(existing) => {
-                let mut file = fs::File::open(&path)?;
-                let mut hasher = Sha256::new();
-                let _ = io::copy(&mut file, &mut hasher)?;
-                let hash = hasher.finalize();
+                if factory_hash.as_slice() == existing.hash.as_slice() {
+                    // Nothing changed in the factory - no need to copy
+                    return Ok(());
+                }
 
-                if hash.as_slice() == existing.hash.as_slice() {
-                    // Unchanged
+                // Has the user changed or deleted the file?
+                if !etc_path.exists() {
+                    eprintln!("Skipping user-deleted file {}!", etc_path.display());
+                    return Ok(());
+                }
+
+                if file_hasher(&etc_path)?.finalize().as_slice() != existing.hash.as_slice() {
+                    eprintln!("Skipping user-modified file {}!", etc_path.display());
                     return Ok(());
                 }
             }
@@ -326,7 +329,7 @@ impl EtcFactory {
         self.files.insert(
             relative_path.to_path_buf(),
             FileEntry {
-                hash: hash.to_vec(),
+                hash: factory_hash.to_vec(),
             },
         );
 
@@ -355,12 +358,7 @@ impl EtcFactory {
 
             let path = etc.join(relative_path);
 
-            let mut file = File::open(&path)?;
-            let mut hasher = Sha256::new();
-            let _ = io::copy(&mut file, &mut hasher)?;
-            let hash = hasher.finalize();
-
-            if hash.as_slice() != info.hash.as_slice() {
+            if file_hasher(&path)?.finalize().as_slice() != info.hash.as_slice() {
                 // File was changed by user. Don't remove it.
                 continue;
             }
@@ -488,6 +486,13 @@ impl EtcFactory {
 
         Ok(new_update)
     }
+}
+
+fn file_hasher(path: &Path) -> Result<impl Digest, Box<dyn Error>> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let _ = io::copy(&mut file, &mut hasher)?;
+    Ok(hasher)
 }
 
 fn seed_subvolume(etc: &str) -> Result<(), Box<dyn Error>> {
@@ -647,17 +652,27 @@ mod test {
         assert_eq!(factory.links.keys().len(), 1);
 
         // Remove dangling file ------------------------------------------------
-
         fs::remove_file(Path::new(&Paths::factory()).join("arelativelink")).ok();
+
+        // User modifies a file in /etc
+        fs::write(etc.join("adir/morefile1"), "user_modified")?;
+
+        // User deletes a file from /etc
+        fs::remove_file(etc.join("adir/morefile2")).ok();
 
         sleep(std::time::Duration::from_secs(1)); // Ensure time changes
         let mut factory = EtcFactory::new(etc.join(CONFIG_FILE))?;
         let new_new_update = factory.process_all(etc, migrate)?;
 
         assert_ne!(new_update, new_new_update);
+        // File metadata is retained, including for the user-deleted file
         assert_eq!(factory.files.keys().len(), 4);
         // Link has been removed as dangling
         assert_eq!(factory.links.keys().len(), 0);
+
+        // User modification and deletion have been retained
+        assert_eq!(fs::read_to_string(etc.join("adir/morefile1"))?, "user_modified");
+        assert!(!etc.join("adir/morefile2").exists());
 
         Ok(())
     }

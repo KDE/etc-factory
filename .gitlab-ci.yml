@@ -16,7 +16,7 @@ rust-latest:
   tags:
     - VM
     - amd64
-  image: storage.kde.org/vm-images/kde-linux-builder
+  image: s3.kde.org/ci-vm-images/kde-linux-builder
   # before_script:
   #   - apt-get update
   #   - apt-get install -y clang llvm-dev libclang-dev pkg-config libbtrfsutil-dev btrfs-progs
